@@ -4,10 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"os"
+	"log"
 	"path/filepath"
 	"strings"
 
+	"github.com/xuri/excelize/v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -15,7 +16,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
-	"github.com/xuri/excelize/v2"
 )
 
 // ReportItem 儲存單一工作負載的可用性報告結果
@@ -27,6 +27,7 @@ type ReportItem struct {
 	EligibleNodeCount   int
 	EligibleNodes       []string
 	AllowedNodeFailures int
+	PVAccessModes       string
 	Flags               []string
 }
 
@@ -38,39 +39,51 @@ type WorkloadSummary struct {
 	Replicas  int32
 	Labels    map[string]string
 	PodSpec   corev1.PodSpec
+	PVModes   string
 }
 
 func main() {
 	// 1. 初始化 Kubernetes Client
 	config, err := getKubeConfig()
 	if err != nil {
-		fmt.Printf("取得 kubeconfig 失敗: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("取得 kubeconfig 失敗: %v", err)
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		fmt.Printf("建立 clientset 失敗: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("建立 clientset 失敗: %v", err)
 	}
 
 	ctx := context.TODO()
 
 	// 2. 抓取叢集內所有 Node
-	fmt.Println("正在抓取 Nodes...")
+	log.Println("正在抓取 Nodes...")
 	nodesObj, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		fmt.Printf("抓取 Nodes 失敗: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("抓取 Nodes 失敗: %v", err)
+	}
+	log.Printf("成功抓取 %d 個 Nodes", len(nodesObj.Items))
+
+	// 2-1. 預先抓取所有 PVC 以便比對 AccessModes
+	log.Println("正在抓取 PersistentVolumeClaims...")
+	pvcs, err := clientset.CoreV1().PersistentVolumeClaims("").List(ctx, metav1.ListOptions{})
+	pvcMap := make(map[string]corev1.PersistentVolumeClaim)
+	if err == nil {
+		for _, pvc := range pvcs.Items {
+			pvcMap[fmt.Sprintf("%s/%s", pvc.Namespace, pvc.Name)] = pvc
+		}
 	}
 
 	// 3. 抓取所有 Namespace 的 Workloads (Deployments, StatefulSets, DaemonSets)
-	fmt.Println("正在掃描所有 Namespace 的 Workloads...")
+	log.Println("正在掃描所有 Namespace 的 Workloads...")
 	var workloads []WorkloadSummary
 
 	// 3-1. Deployments
 	deps, err := clientset.AppsV1().Deployments("").List(ctx, metav1.ListOptions{})
-	if err == nil {
+	if err != nil {
+		log.Printf("抓取 Deployments 失敗: %v", err)
+	} else {
+		log.Printf("正在處理 %d 個 Deployments...", len(deps.Items))
 		for _, d := range deps.Items {
 			var reps int32 = 1
 			if d.Spec.Replicas != nil {
@@ -83,13 +96,17 @@ func main() {
 				Replicas:  reps,
 				Labels:    d.Spec.Template.Labels,
 				PodSpec:   d.Spec.Template.Spec,
+				PVModes:   extractPVModes(d.Namespace, d.Spec.Template.Spec, pvcMap, nil),
 			})
 		}
 	}
 
 	// 3-2. StatefulSets
 	sts, err := clientset.AppsV1().StatefulSets("").List(ctx, metav1.ListOptions{})
-	if err == nil {
+	if err != nil {
+		log.Printf("抓取 StatefulSets 失敗: %v", err)
+	} else {
+		log.Printf("正在處理 %d 個 StatefulSets...", len(sts.Items))
 		for _, s := range sts.Items {
 			var reps int32 = 1
 			if s.Spec.Replicas != nil {
@@ -102,13 +119,17 @@ func main() {
 				Replicas:  reps,
 				Labels:    s.Spec.Template.Labels,
 				PodSpec:   s.Spec.Template.Spec,
+				PVModes:   extractPVModes(s.Namespace, s.Spec.Template.Spec, pvcMap, s.Spec.VolumeClaimTemplates),
 			})
 		}
 	}
 
 	// 3-3. DaemonSets
 	dsets, err := clientset.AppsV1().DaemonSets("").List(ctx, metav1.ListOptions{})
-	if err == nil {
+	if err != nil {
+		log.Printf("抓取 DaemonSets 失敗: %v", err)
+	} else {
+		log.Printf("正在處理 %d 個 DaemonSets...", len(dsets.Items))
 		for _, ds := range dsets.Items {
 			workloads = append(workloads, WorkloadSummary{
 				Namespace: ds.Namespace,
@@ -117,32 +138,45 @@ func main() {
 				Replicas:  0, // DaemonSet 的副本數隨節點變動，此處不適用固定數字
 				Labels:    ds.Spec.Template.Labels,
 				PodSpec:   ds.Spec.Template.Spec,
+				PVModes:   extractPVModes(ds.Namespace, ds.Spec.Template.Spec, pvcMap, nil),
 			})
 		}
 	}
 
-        // 3-4. Standalone Pods (無 Controller 管理的獨立 Pod)
-	fmt.Println("正在掃描獨立的 Bare Pods...")
+	// 3-4. Standalone Pods (無 Controller 管理的獨立 Pod)
+	log.Println("正在掃描獨立的 Bare Pods...")
 	podsObj, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
-	if err == nil {
+	if err != nil {
+		log.Printf("抓取 Pods 失敗: %v", err)
+	} else {
+		log.Printf("正在篩選 %d 個 Pods...", len(podsObj.Items))
 		for _, p := range podsObj.Items {
-			// 檢查是否有 OwnerReferences。如果長度為 0，代表它是單獨存在的 Pod
-			// 同時過濾掉已經執行完畢 (Succeeded) 或失敗 (Failed) 的 Pod
-			if len(p.OwnerReferences) == 0 && p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
+			// Static Pods (Mirror Pods) 通常帶有特定的 annotation
+			isStatic := p.Annotations["kubernetes.io/config.source"] != "" || p.Annotations["kubernetes.io/config.mirror"] != ""
+
+			// 篩選條件：
+			// 1. 沒有 OwnerReferences (Bare Pod) 或 它是 Static Pod
+			// 2. 排除已經結束的狀態 (Succeeded/Failed)
+			if (len(p.OwnerReferences) == 0 || isStatic) && p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
+				kind := "Pod"
+				if isStatic {
+					kind = "Static Pod"
+				}
 				workloads = append(workloads, WorkloadSummary{
 					Namespace: p.Namespace,
 					Name:      p.Name,
-					Kind:      "Pod", // 標記為單一 Pod
+					Kind:      kind,
 					Replicas:  1,
 					Labels:    p.Labels,
 					PodSpec:   p.Spec,
+					PVModes:   extractPVModes(p.Namespace, p.Spec, pvcMap, nil),
 				})
 			}
 		}
 	}
 
 	// 4. 產生報告
-	fmt.Println("開始分析可用性與容錯機制...\n")
+	log.Println("開始分析可用性與容錯機制...")
 	reports := GenerateOcpAvailabilityReport(nodesObj.Items, workloads)
 
 	// 5. 輸出報告 (終端機格式化輸出)
@@ -151,12 +185,44 @@ func main() {
 	fileName := "ocp_availability_report.xlsx"
 	err = ExportToExcel(reports, fileName)
 	if err != nil {
-		fmt.Printf("匯出 Excel 失敗: %v\n", err)
+		log.Printf("匯出 Excel 失敗: %v", err)
 	} else {
-		fmt.Printf("成功匯出報告至: %s\n", fileName)
+		log.Printf("成功匯出報告至: %s", fileName)
 	}
 }
 
+// extractPVModes 從 PodSpec 與 VolumeClaimTemplates 中提取 PV 的 AccessModes
+func extractPVModes(ns string, spec corev1.PodSpec, pvcMap map[string]corev1.PersistentVolumeClaim, vct []corev1.PersistentVolumeClaim) string {
+	modes := make(map[string]bool)
+
+	// 檢查 PodSpec 中的 Volumes
+	for _, vol := range spec.Volumes {
+		if vol.PersistentVolumeClaim != nil {
+			key := fmt.Sprintf("%s/%s", ns, vol.PersistentVolumeClaim.ClaimName)
+			if pvc, ok := pvcMap[key]; ok {
+				for _, m := range pvc.Spec.AccessModes {
+					modes[string(m)] = true
+				}
+			}
+		}
+	}
+
+	// 針對 StatefulSet 的 VolumeClaimTemplates
+	for _, pvcTmpl := range vct {
+		for _, m := range pvcTmpl.Spec.AccessModes {
+			modes[string(m)] = true
+		}
+	}
+
+	if len(modes) == 0 {
+		return "None"
+	}
+	var res []string
+	for m := range modes {
+		res = append(res, m)
+	}
+	return strings.Join(res, ", ")
+}
 
 // ExportToExcel 實作匯出邏輯
 func ExportToExcel(reports []ReportItem, filename string) error {
@@ -165,7 +231,7 @@ func ExportToExcel(reports []ReportItem, filename string) error {
 	f.SetSheetName("Sheet1", sheetName)
 
 	// 設定表頭
-	headers := []string{"Namespace", "Workload Name", "Type", "Replicas", "Eligible Nodes Count", "Allowed Node Failures", "Flags / Warnings"}
+	headers := []string{"Namespace", "Workload Name", "Type", "Replicas", "PV Access Modes", "Eligible Nodes Count", "Allowed Node Failures", "Flags / Warnings"}
 	for i, header := range headers {
 		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
 		f.SetCellValue(sheetName, cell, header)
@@ -178,9 +244,10 @@ func ExportToExcel(reports []ReportItem, filename string) error {
 		f.SetCellValue(sheetName, fmt.Sprintf("B%d", row), r.WorkloadName)
 		f.SetCellValue(sheetName, fmt.Sprintf("C%d", row), r.Type)
 		f.SetCellValue(sheetName, fmt.Sprintf("D%d", row), r.Replicas)
-		f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), r.EligibleNodeCount)
-		f.SetCellValue(sheetName, fmt.Sprintf("F%d", row), r.AllowedNodeFailures)
-		f.SetCellValue(sheetName, fmt.Sprintf("G%d", row), strings.Join(r.Flags, " | "))
+		f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), r.PVAccessModes)
+		f.SetCellValue(sheetName, fmt.Sprintf("F%d", row), r.EligibleNodeCount)
+		f.SetCellValue(sheetName, fmt.Sprintf("G%d", row), r.AllowedNodeFailures)
+		f.SetCellValue(sheetName, fmt.Sprintf("H%d", row), strings.Join(r.Flags, " | "))
 	}
 
 	// 套用基本的樣式 (加粗表頭)
@@ -188,7 +255,7 @@ func ExportToExcel(reports []ReportItem, filename string) error {
 		Font: &excelize.Font{Bold: true},
 		Fill: excelize.Fill{Type: "pattern", Color: []string{"#E0E0E0"}, Pattern: 1},
 	})
-	f.SetCellStyle(sheetName, "A1", "G1", style)
+	f.SetCellStyle(sheetName, "A1", "H1", style)
 
 	return f.SaveAs(filename)
 }
@@ -240,6 +307,7 @@ func GenerateOcpAvailabilityReport(nodes []corev1.Node, workloads []WorkloadSumm
 			EligibleNodeCount:   eligibleNodeCount,
 			EligibleNodes:       eligibleNodes,
 			AllowedNodeFailures: allowedFailures,
+			PVAccessModes:       wl.PVModes,
 			Flags:               []string{},
 		}
 
@@ -249,8 +317,12 @@ func GenerateOcpAvailabilityReport(nodes []corev1.Node, workloads []WorkloadSumm
 		if hasInterWorkloadAntiAffinity {
 			item.Flags = append(item.Flags, "【風險】設有 Inter-Workload Anti-Affinity，受其他服務位置影響")
 		}
-		if wl.Kind == "Pod" {
-			item.Flags = append(item.Flags, "【高風險】此為無 Controller 管理的獨立 Pod (Bare Pod)，節點失效時將無法自動重啟或轉移。")
+		if wl.Kind == "Pod" || wl.Kind == "Static Pod" {
+			item.Flags = append(item.Flags, fmt.Sprintf("【高風險】此為 %s，節點失效時將無法自動重啟或轉移。", wl.Kind))
+		}
+		// 如果發現 RWO 但副本數 > 1，增加警告
+		if strings.Contains(wl.PVModes, "ReadWriteOnce") && wl.Replicas > 1 && wl.Kind != "StatefulSet" {
+			item.Flags = append(item.Flags, "【警告】多副本工作負載使用 RWO PV，可能導致 Pod 漂移時因掛載競爭而啟動失敗")
 		}
 
 		report = append(report, item)
@@ -341,10 +413,10 @@ func CalculateAllowedFailures(eligibleNodeCount int, replicas int32, workloadTyp
 	case "DaemonSet":
 		return max(0, eligibleNodeCount-1)
 
-	case "Pod":
-                // 獨立的 Pod 沒有控制器 (Controller) 幫忙做故障轉移 (Failover)。
-                // 所在的節點一掛，Pod 就沒了，因此在架構上容忍節點失效的數量為 0。
-                return 0
+	case "Pod", "Static Pod":
+		// 獨立的 Pod 沒有控制器 (Controller) 幫忙做故障轉移 (Failover)。
+		// 所在的節點一掛，Pod 就沒了，因此在架構上容忍節點失效的數量為 0。
+		return 0
 	}
 	return 0
 }
@@ -367,13 +439,21 @@ func MatchNodeSelectorTerms(nodeLabels map[string]string, terms []corev1.NodeSel
 			val, exists := nodeLabels[expr.Key]
 			switch expr.Operator {
 			case corev1.NodeSelectorOpIn:
-				if !exists || !contains(expr.Values, val) { match = false }
+				if !exists || !contains(expr.Values, val) {
+					match = false
+				}
 			case corev1.NodeSelectorOpNotIn:
-				if exists && contains(expr.Values, val) { match = false }
+				if exists && contains(expr.Values, val) {
+					match = false
+				}
 			case corev1.NodeSelectorOpExists:
-				if !exists { match = false }
+				if !exists {
+					match = false
+				}
 			case corev1.NodeSelectorOpDoesNotExist:
-				if exists { match = false }
+				if exists {
+					match = false
+				}
 			}
 		}
 		if match {
@@ -382,7 +462,6 @@ func MatchNodeSelectorTerms(nodeLabels map[string]string, terms []corev1.NodeSel
 	}
 	return false
 }
-
 
 func HasLocalStorageAttached(podSpec corev1.PodSpec) bool {
 	for _, vol := range podSpec.Volumes {
@@ -403,7 +482,6 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-
 // ============== 列印輸出邏輯 ==============
 
 func PrintReport(reports []ReportItem) {
@@ -411,8 +489,9 @@ func PrintReport(reports []ReportItem) {
 	for _, r := range reports {
 		fmt.Printf("[%s] %s (%s) | Replicas: %d\n", r.Namespace, r.WorkloadName, r.Type, r.Replicas)
 		fmt.Printf("  - 可調度節點數: %d\n", r.EligibleNodeCount)
+		fmt.Printf("  - PV 存取模式: %s\n", r.PVAccessModes)
 		fmt.Printf("  - 允許失效節點數: %d\n", r.AllowedNodeFailures)
-		
+
 		if len(r.Flags) > 0 {
 			for _, flag := range r.Flags {
 				fmt.Printf("  * %s\n", flag)
