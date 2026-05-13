@@ -10,6 +10,7 @@ import (
 
 	"github.com/xuri/excelize/v2"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
@@ -28,6 +29,10 @@ type ReportItem struct {
 	EligibleNodes       []string
 	AllowedNodeFailures int
 	PVAccessModes       string
+	PriorityClass       string
+	HasResourceRequests bool
+	HasProbes           bool
+	PDBStatus           string
 	Flags               []string
 }
 
@@ -39,7 +44,11 @@ type WorkloadSummary struct {
 	Replicas  int32
 	Labels    map[string]string
 	PodSpec   corev1.PodSpec
+	Priority  string
+	HasReq    bool
+	HasProbe  bool
 	PVModes   string
+	PDBInfo   string
 }
 
 func main() {
@@ -64,7 +73,7 @@ func main() {
 	}
 	log.Printf("成功抓取 %d 個 Nodes", len(nodesObj.Items))
 
-	// 2-1. 預先抓取所有 PVC 以便比對 AccessModes
+	// 2-1. 預先抓取所有 PVC
 	log.Println("正在抓取 PersistentVolumeClaims...")
 	pvcs, err := clientset.CoreV1().PersistentVolumeClaims("").List(ctx, metav1.ListOptions{})
 	pvcMap := make(map[string]corev1.PersistentVolumeClaim)
@@ -72,6 +81,14 @@ func main() {
 		for _, pvc := range pvcs.Items {
 			pvcMap[fmt.Sprintf("%s/%s", pvc.Namespace, pvc.Name)] = pvc
 		}
+	}
+
+	// 2-2. 預先抓取所有 PDB
+	log.Println("正在抓取 PodDisruptionBudgets...")
+	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
+	pdbList := []policyv1.PodDisruptionBudget{}
+	if err == nil {
+		pdbList = pdbs.Items
 	}
 
 	// 3. 抓取所有 Namespace 的 Workloads (Deployments, StatefulSets, DaemonSets)
@@ -96,7 +113,11 @@ func main() {
 				Replicas:  reps,
 				Labels:    d.Spec.Template.Labels,
 				PodSpec:   d.Spec.Template.Spec,
+				Priority:  d.Spec.Template.Spec.PriorityClassName,
+				HasReq:    checkResourceRequests(d.Spec.Template.Spec),
+				HasProbe:  checkProbes(d.Spec.Template.Spec),
 				PVModes:   extractPVModes(d.Namespace, d.Spec.Template.Spec, pvcMap, nil),
+				PDBInfo:   findMatchingPDB(d.Namespace, d.Spec.Template.Labels, pdbList),
 			})
 		}
 	}
@@ -119,7 +140,11 @@ func main() {
 				Replicas:  reps,
 				Labels:    s.Spec.Template.Labels,
 				PodSpec:   s.Spec.Template.Spec,
+				Priority:  s.Spec.Template.Spec.PriorityClassName,
+				HasReq:    checkResourceRequests(s.Spec.Template.Spec),
+				HasProbe:  checkProbes(s.Spec.Template.Spec),
 				PVModes:   extractPVModes(s.Namespace, s.Spec.Template.Spec, pvcMap, s.Spec.VolumeClaimTemplates),
+				PDBInfo:   findMatchingPDB(s.Namespace, s.Spec.Template.Labels, pdbList),
 			})
 		}
 	}
@@ -138,7 +163,11 @@ func main() {
 				Replicas:  0, // DaemonSet 的副本數隨節點變動，此處不適用固定數字
 				Labels:    ds.Spec.Template.Labels,
 				PodSpec:   ds.Spec.Template.Spec,
+				Priority:  ds.Spec.Template.Spec.PriorityClassName,
+				HasReq:    checkResourceRequests(ds.Spec.Template.Spec),
+				HasProbe:  checkProbes(ds.Spec.Template.Spec),
 				PVModes:   extractPVModes(ds.Namespace, ds.Spec.Template.Spec, pvcMap, nil),
+				PDBInfo:   findMatchingPDB(ds.Namespace, ds.Spec.Template.Labels, pdbList),
 			})
 		}
 	}
@@ -169,7 +198,11 @@ func main() {
 					Replicas:  1,
 					Labels:    p.Labels,
 					PodSpec:   p.Spec,
+					Priority:  p.Spec.PriorityClassName,
+					HasReq:    checkResourceRequests(p.Spec),
+					HasProbe:  checkProbes(p.Spec),
 					PVModes:   extractPVModes(p.Namespace, p.Spec, pvcMap, nil),
+					PDBInfo:   findMatchingPDB(p.Namespace, p.Labels, pdbList),
 				})
 			}
 		}
@@ -189,6 +222,40 @@ func main() {
 	} else {
 		log.Printf("成功匯出報告至: %s", fileName)
 	}
+}
+
+// checkResourceRequests 檢查是否所有容器都有設定 Resources.Requests
+func checkResourceRequests(spec corev1.PodSpec) bool {
+	for _, container := range spec.Containers {
+		if container.Resources.Requests.Cpu().IsZero() || container.Resources.Requests.Memory().IsZero() {
+			return false
+		}
+	}
+	return true
+}
+
+// checkProbes 檢查是否至少有定義 Liveness 或 Readiness Probe
+func checkProbes(spec corev1.PodSpec) bool {
+	for _, container := range spec.Containers {
+		if container.ReadinessProbe != nil || container.LivenessProbe != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// findMatchingPDB 尋找與工作負載標籤匹配的 PDB
+func findMatchingPDB(ns string, wlLabels map[string]string, pdbs []policyv1.PodDisruptionBudget) string {
+	for _, pdb := range pdbs {
+		if pdb.Namespace != ns {
+			continue
+		}
+		selector, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+		if err == nil && selector.Matches(labels.Set(wlLabels)) {
+			return fmt.Sprintf("MinAvail: %v, MaxUnavail: %v", pdb.Spec.MinAvailable, pdb.Spec.MaxUnavailable)
+		}
+	}
+	return "None"
 }
 
 // extractPVModes 從 PodSpec 與 VolumeClaimTemplates 中提取 PV 的 AccessModes
@@ -231,7 +298,7 @@ func ExportToExcel(reports []ReportItem, filename string) error {
 	f.SetSheetName("Sheet1", sheetName)
 
 	// 設定表頭
-	headers := []string{"Namespace", "Workload Name", "Type", "Replicas", "PV Access Modes", "Eligible Nodes Count", "Allowed Node Failures", "Flags / Warnings"}
+	headers := []string{"Namespace", "Workload Name", "Type", "Replicas", "Priority", "Resources", "Probes", "PV Access Modes", "PDB Status", "Eligible Nodes Count", "Allowed Node Failures", "Flags / Warnings"}
 	for i, header := range headers {
 		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
 		f.SetCellValue(sheetName, cell, header)
@@ -244,10 +311,14 @@ func ExportToExcel(reports []ReportItem, filename string) error {
 		f.SetCellValue(sheetName, fmt.Sprintf("B%d", row), r.WorkloadName)
 		f.SetCellValue(sheetName, fmt.Sprintf("C%d", row), r.Type)
 		f.SetCellValue(sheetName, fmt.Sprintf("D%d", row), r.Replicas)
-		f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), r.PVAccessModes)
-		f.SetCellValue(sheetName, fmt.Sprintf("F%d", row), r.EligibleNodeCount)
-		f.SetCellValue(sheetName, fmt.Sprintf("G%d", row), r.AllowedNodeFailures)
-		f.SetCellValue(sheetName, fmt.Sprintf("H%d", row), strings.Join(r.Flags, " | "))
+		f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), r.PriorityClass)
+		f.SetCellValue(sheetName, fmt.Sprintf("F%d", row), map[bool]string{true: "Defined", false: "MISSING"}[r.HasResourceRequests])
+		f.SetCellValue(sheetName, fmt.Sprintf("G%d", row), map[bool]string{true: "Configured", false: "NONE"}[r.HasProbes])
+		f.SetCellValue(sheetName, fmt.Sprintf("H%d", row), r.PVAccessModes)
+		f.SetCellValue(sheetName, fmt.Sprintf("I%d", row), r.PDBStatus)
+		f.SetCellValue(sheetName, fmt.Sprintf("J%d", row), r.EligibleNodeCount)
+		f.SetCellValue(sheetName, fmt.Sprintf("K%d", row), r.AllowedNodeFailures)
+		f.SetCellValue(sheetName, fmt.Sprintf("L%d", row), strings.Join(r.Flags, " | "))
 	}
 
 	// 套用基本的樣式 (加粗表頭)
@@ -255,7 +326,7 @@ func ExportToExcel(reports []ReportItem, filename string) error {
 		Font: &excelize.Font{Bold: true},
 		Fill: excelize.Fill{Type: "pattern", Color: []string{"#E0E0E0"}, Pattern: 1},
 	})
-	f.SetCellStyle(sheetName, "A1", "H1", style)
+	f.SetCellStyle(sheetName, "A1", "L1", style)
 
 	return f.SaveAs(filename)
 }
@@ -308,6 +379,10 @@ func GenerateOcpAvailabilityReport(nodes []corev1.Node, workloads []WorkloadSumm
 			EligibleNodes:       eligibleNodes,
 			AllowedNodeFailures: allowedFailures,
 			PVAccessModes:       wl.PVModes,
+			PriorityClass:       wl.Priority,
+			HasResourceRequests: wl.HasReq,
+			HasProbes:           wl.HasProbe,
+			PDBStatus:           wl.PDBInfo,
 			Flags:               []string{},
 		}
 
@@ -323,6 +398,17 @@ func GenerateOcpAvailabilityReport(nodes []corev1.Node, workloads []WorkloadSumm
 		// 如果發現 RWO 但副本數 > 1，增加警告
 		if strings.Contains(wl.PVModes, "ReadWriteOnce") && wl.Replicas > 1 && wl.Kind != "StatefulSet" {
 			item.Flags = append(item.Flags, "【警告】多副本工作負載使用 RWO PV，可能導致 Pod 漂移時因掛載競爭而啟動失敗")
+		}
+		// 檢查 Topology Spread Constraints
+		if len(wl.PodSpec.TopologySpreadConstraints) > 0 {
+			item.Flags = append(item.Flags, "【資訊】設定了 Topology Spread Constraints，實際可用性取決於拓撲分佈狀態")
+		}
+		// 靜態資源風險檢查
+		if !wl.HasReq {
+			item.Flags = append(item.Flags, "【高風險】未設定 Resource Requests (BestEffort QoS)，在資源緊繃時會優先被驅逐")
+		}
+		if !wl.HasProbe {
+			item.Flags = append(item.Flags, "【注意】未設定 Liveness/Readiness Probes，無法保證 Pod 轉移後服務的健康狀態")
 		}
 
 		report = append(report, item)
@@ -394,23 +480,19 @@ func CalculateAllowedFailures(eligibleNodeCount int, replicas int32, workloadTyp
 	if eligibleNodeCount == 0 {
 		return 0
 	}
+
+	if replicas == 1 {
+		return 0
+	}
+
 	switch workloadType {
-	case "Deployment", "ReplicaSet":
-		if hasSelfAntiAffinity {
-			if eligibleNodeCount <= int(replicas) {
-				return 0
-			}
-			return eligibleNodeCount - int(replicas)
-		}
+	case "Deployment", "ReplicaSet", "DaemonSet":
 		return max(0, eligibleNodeCount-1)
 
 	case "StatefulSet":
 		if HasLocalStorageAttached(podSpec) {
 			return 0
 		}
-		return max(0, eligibleNodeCount-1)
-
-	case "DaemonSet":
 		return max(0, eligibleNodeCount-1)
 
 	case "Pod", "Static Pod":
@@ -490,6 +572,9 @@ func PrintReport(reports []ReportItem) {
 		fmt.Printf("[%s] %s (%s) | Replicas: %d\n", r.Namespace, r.WorkloadName, r.Type, r.Replicas)
 		fmt.Printf("  - 可調度節點數: %d\n", r.EligibleNodeCount)
 		fmt.Printf("  - PV 存取模式: %s\n", r.PVAccessModes)
+		fmt.Printf("  - Priority Class: %s\n", r.PriorityClass)
+		fmt.Printf("  - 資源請求: %v, Probes: %v\n", r.HasResourceRequests, r.HasProbes)
+		fmt.Printf("  - PDB 狀態: %s\n", r.PDBStatus)
 		fmt.Printf("  - 允許失效節點數: %d\n", r.AllowedNodeFailures)
 
 		if len(r.Flags) > 0 {
